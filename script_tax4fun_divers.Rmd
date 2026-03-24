@@ -1,0 +1,1778 @@
+---
+title: "Untitled"
+author: "Julian Mittmann-Goetsch"
+date: "2025-04-28"
+output: html_document
+---
+# Step 2: DESeq2 Analysis
+Following: https://lashlock.github.io/compbio/R_presentation.html 
+## Step 2a: Intitialise DESeq 2 analysis
+```{r}
+# Prepare the count data, excluding MOCK samples and neg and pos controls
+
+## IMPORTANT: CUrrently we add a count of 1 to each sample, to avoid errors with log functions later on, we could set this to an even smaller number or do some other workaround
+countData <- tab_rare  %>%
+  select(-tail(names(tab_rare), 6), -c("X136", "X137", "X138", "X139")) %>%
+  #rownames_to_column(var = "ASV") %>%
+  mutate(across(where(is.numeric), ~ . + 1))
+
+# Prepare the metaData for the dds matrix, add Information on Layers
+metaData <- metadata %>%
+  mutate(Layer = case_when(
+    Depth %in% c("0-5 cm", "5-10 cm", "20-30 cm") ~ "Top-soil (0-30 cm)",
+    Depth %in% c("40-50 cm", "80-100 cm") ~ "Bottom-soil (40-100 cm)",
+    TRUE ~ NA_character_  # For unexpected values
+  ))
+
+rownames(metaData) <- metaData$Sample_ID
+countData <- countData[, rownames(metaData)]
+
+# Control if all Sample Ids are assigned correctly
+all(colnames(countData) == rownames(metaData))
+
+# DESeq2
+dds <- DESeqDataSetFromMatrix(countData = countData, 
+                              colData = metaData, 
+                              design = ~Treatment)
+dds
+
+# Set reference level to ambient
+dds$Treatment <- relevel(dds$Treatment, ref = "ambient")
+dds <- DESeq(dds)
+res <- results(dds)
+head(results(dds, tidy=TRUE)) 
+summary(res) 
+res <- res[order(res$padj),]
+head(res)
+
+vsd <- varianceStabilizingTransformation(dds, blind = TRUE)
+head(assay(vsd), 3)
+```
+
+## Step 2c: Subset DESeq 2 ggplot2 without NAS
+```{r}
+create_volcano_plot <- function(res, title) {
+  df <- as.data.frame(res)
+   df <- df[complete.cases(df), ]
+  df$significant <- ifelse(df$padj < 0.05, 
+                           ifelse(df$log2FoldChange < 0, "Down", "Up"), 
+                           "Not Significant")
+  
+  ggplot(df, aes(x = log2FoldChange, y = -log10(pvalue), color = significant)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    scale_color_manual(values = c("Down" = "blue", "Up" = "red", "Not Significant" = "gray")) +
+    xlim(-3, 3) +
+    ylim(0, 6) +
+    labs(title = title,
+         x = "log2 Fold Change",
+         y = "-log10 p-value") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+
+analyze_and_plot <- function(dds_subset, title_suffix) {
+  dds_subset$Treatment <- relevel(dds_subset$Treatment, ref = "ambient")
+  
+  res_1.5 <- results(dds_subset, contrast = c("Treatment", "1.5", "ambient"))
+  res_1.5 <- res_1.5[order(res_1.5$padj), ]
+  
+  res_3.0 <- results(dds_subset, contrast = c("Treatment", "3", "ambient"))
+  res_3.0 <- res_3.0[order(res_3.0$padj), ]
+  
+  plot_1.5 <- create_volcano_plot(res_1.5, paste("+1.5°C vs Ambient -", title_suffix))
+  plot_3.0 <- create_volcano_plot(res_3.0, paste("+3.0°C vs Ambient -", title_suffix))
+  
+  grid.arrange(plot_1.5, plot_3.0, ncol = 2)
+}
+
+plots_PZ <- analyze_and_plot(dds_PZ, "PZ")
+plots_LM <- analyze_and_plot(dds_LM, "LM")
+plots_HM <- analyze_and_plot(dds_HM, "HM")
+
+grid.arrange(plots_PZ, plots_LM, plots_HM, ncol = 1)
+```
+## Step 2g: Extract significantly up/downregulated Genes
+```{r}
+analyze_and_plot <- function(dds_subset, zone) {
+  dds_subset$Treatment <- relevel(dds_subset$Treatment, ref = "ambient")
+  
+  res_1.5 <- results(dds_subset, contrast = c("Treatment", "1.5", "ambient"))
+  res_1.5 <- res_1.5[order(res_1.5$padj), ]
+  
+  res_3.0 <- results(dds_subset, contrast = c("Treatment", "3", "ambient"))
+  res_3.0 <- res_3.0[order(res_3.0$padj), ]
+  
+  # Filter and add Zone and Treatment information
+  res_table_1.5 <- res_1.5 %>% 
+    data.frame() %>% 
+    filter(padj < 0.05) %>%
+    mutate(Zone = zone, Treatment = "1.5")
+  
+  res_table_3.0 <- res_3.0 %>% 
+    data.frame() %>% 
+    filter(padj < 0.05) %>%
+    mutate(Zone = zone, Treatment = "3.0")
+  
+  # Combine the filtered results
+  combined_results <- rbind(res_table_1.5, res_table_3.0)
+  
+  return(combined_results)
+}
+
+# Now you can run your analysis for each zone
+results_PZ <- analyze_and_plot(dds_PZ, "PZ")
+results_LM <- analyze_and_plot(dds_LM, "LM")
+results_HM <- analyze_and_plot(dds_HM, "HM")
+
+# Combine all results
+final_results <- rbind(results_PZ, results_LM, results_HM)
+
+
+final_results <- final_results %>%
+  tibble::rownames_to_column(var = "ASV") %>%
+  select(ASV, everything())
+
+# Merge final_results with taxonomy data
+
+# First, convert rownames to a column in the asv dataframe
+asv_with_ids <- asv %>%
+  rownames_to_column(var = "ASV")
+
+# Now join with the final_results
+final_results_with_taxonomy <- final_results %>%
+  left_join(asv_with_ids, by = "ASV")
+
+# Reorder columns if needed
+final_results_with_taxonomy <- final_results_with_taxonomy %>%
+  select(ASV, Kingdom, Phylum, Class, Order, Family, Genus, log2FoldChange, padj, Zone, Treatment)
+
+# Save it to a CSV file
+write.csv(final_results_with_taxonomy, "df_deseq2_genes.csv", row.names = FALSE)
+```
+
+
+```{r}
+
+# Read the CSV file, which was previously generated and edited in Excel (add citations, functions)
+df_genes_citation <- read.csv("df_deseq2_genes_citations.csv", sep = ";", dec = ".")
+
+# Round padj and log2FoldChange to two decimal places and remove some columns
+df_simplified <- df_genes_citation %>%
+  mutate(
+    padj = round(padj, 3),
+    log2FoldChange = round(log2FoldChange, 3)
+  )# %>%
+  #select(-c(Kingdom, Source, pH, Additional)) # Remove these columns
+
+# Create a simple table for up-regulated genes
+up_regulated <- df_simplified %>% 
+  filter(log2FoldChange > 0) %>%
+  arrange(Zone, Treatment, desc(log2FoldChange))
+
+# Display the table using gt
+up_regulated %>%
+  gt() %>%
+  tab_header(title = "Up-regulated Genes") %>%
+  cols_align(align = "left") %>%
+  tab_options(table.font.size = 12)
+
+# Create a simple table for down-regulated genes
+down_regulated <- df_simplified %>% 
+  filter(log2FoldChange <= 0) %>%
+  arrange(Zone, Treatment, desc(log2FoldChange))
+
+# Display the table using gt
+down_regulated %>%
+  gt() %>%
+  tab_header(title = "Down-regulated Genes") %>%
+  cols_align(align = "left") %>%
+  tab_options(table.font.size = 12)
+
+```
+
+
+## Step 2d: DESeq2 on Layer Zone Treatment
+```{r}
+# Function to subset by Zone and Layer
+subset_and_analyze <- function(dds, zone, layer) {
+  dds_subset <- dds[, dds$Zone == zone & dds$Layer == layer]
+  dds_subset <- DESeq(dds_subset)
+  return(dds_subset)
+}
+
+# Subset and analyze for each Zone and Layer combination
+dds_PZ_top <- subset_and_analyze(dds, "PZ", "Top-soil (0-30 cm)")
+dds_PZ_bottom <- subset_and_analyze(dds, "PZ", "Bottom-soil (40-100 cm)")
+dds_LM_top <- subset_and_analyze(dds, "LM", "Top-soil (0-30 cm)")
+dds_LM_bottom <- subset_and_analyze(dds, "LM", "Bottom-soil (40-100 cm)")
+dds_HM_top <- subset_and_analyze(dds, "HM", "Top-soil (0-30 cm)")
+dds_HM_bottom <- subset_and_analyze(dds, "HM", "Bottom-soil (40-100 cm)")
+
+# Function for volcano plots
+create_volcano_plot <- function(res, title) {
+  df <- as.data.frame(res)
+  
+  df <- df[complete.cases(df), ]
+    
+  df$significant <- ifelse(df$padj < 0.05, 
+                           ifelse(df$log2FoldChange < 0, "Down", "Up"), 
+                           "NS")
+  
+  ggplot(df, aes(x = log2FoldChange, y = -log10(pvalue), color = significant)) +
+    geom_point(alpha = 0.6, size = 1) +
+    scale_color_manual(values = c("Down" = "blue", "Up" = "red", "NS" = "gray")) +
+    xlim(-3, 3) +
+    ylim(0, max(-log10(df$pvalue))) +
+    labs(title = title, x = "log2 Fold Change", y = "-log10 p-value") +
+    theme_minimal() +
+    theme(legend.position = "none")
+}
+
+# Function for plotting
+analyze_and_plot <- function(dds_subset, title_suffix) {
+  dds_subset$Treatment <- relevel(dds_subset$Treatment, ref = "ambient")
+  
+  res_1.5 <- results(dds_subset, contrast = c("Treatment", "1.5", "ambient"))
+  res_3.0 <- results(dds_subset, contrast = c("Treatment", "3", "ambient"))
+  
+  plot_1.5 <- create_volcano_plot(res_1.5, paste("+1.5°C vs Ambient -", title_suffix))
+  plot_3.0 <- create_volcano_plot(res_3.0, paste("+3.0°C vs Ambient -", title_suffix))
+  
+  list(plot_1.5, plot_3.0)
+}
+
+# All plots
+plots_PZ_top <- analyze_and_plot(dds_PZ_top, "PZ - Top-soil")
+plots_PZ_bottom <- analyze_and_plot(dds_PZ_bottom, "PZ - Bottom-soil")
+plots_LM_top <- analyze_and_plot(dds_LM_top, "LM - Top-soil")
+plots_LM_bottom <- analyze_and_plot(dds_LM_bottom, "LM - Bottom-soil")
+plots_HM_top <- analyze_and_plot(dds_HM_top, "HM - Top-soil")
+plots_HM_bottom <- analyze_and_plot(dds_HM_bottom, "HM - Bottom-soil")
+
+# Arranged Plot
+all_plots <- c(plots_PZ_top, plots_PZ_bottom, 
+               plots_LM_top, plots_LM_bottom, 
+               plots_HM_top, plots_HM_bottom)
+
+grid.arrange(grobs = all_plots, ncol = 2)
+```
+
+## Step 2e: DESeq 2 Heatmaps
+```{r}
+# Function to create heatmap
+create_heatmap <- function(vsd, dds, title) {
+  # Get top 10 ASVs
+  assay_data <- assay(vsd)
+  row_vars <- apply(assay_data, 1, var)
+  top_10_asvs <- names(sort(row_vars, decreasing = TRUE)[1:10])
+  top_10_data <- assay_data[top_10_asvs, ]
+  
+  # Prepare data for plotting
+  data_long <- top_10_data %>%
+    as.data.frame() %>%
+    rownames_to_column("ASV") %>%
+    pivot_longer(cols = -ASV, names_to = "Sample", values_to = "Abundance")
+  
+  data_long$Treatment <- factor(colData(dds)$Treatment[match(data_long$Sample, colnames(assay_data))])
+  
+  # Create heatmap
+  ggplot(data_long, aes(x = Sample, y = ASV, fill = Abundance)) +
+    geom_tile() +
+    scale_fill_viridis_c() +
+    facet_grid(~ Treatment, scales = "free_x", space = "free_x") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+          axis.title.x = element_blank(),
+          panel.grid = element_blank()) +
+    labs(title = title, y = "ASV", fill = "Abundance")
+}
+
+# All Plots
+plot_PZ <- create_heatmap(vsd_PZ, dds_PZ, "Top 10 ASVs - Pioneer Zone")
+plot_LM <- create_heatmap(vsd_LM, dds_LM, "Top 10 ASVs - Low Marsh")
+plot_HM <- create_heatmap(vsd_HM, dds_HM, "Top 10 ASVs - High Marsh")
+
+# Arranged plot
+grid.arrange(plot_PZ, plot_LM, plot_HM, ncol = 1)
+```
+
+
+
+# Tax4Fun2 - Visualize Functional Predictions using ggpicrust2
+Following: https://github.com/cafferychen777/ggpicrust2 
+```{r}
+install.packages("ggpicrust2")
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+pkgs <- c("phyloseq", "ALDEx2", "SummarizedExperiment", "Biobase", "devtools", 
+          "ComplexHeatmap", "BiocGenerics", "BiocManager", "metagenomeSeq", 
+          "Maaslin2", "edgeR", "lefser", "limma", "KEGGREST", "DESeq2")
+
+for (pkg in pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE))
+    BiocManager::install(pkg)
+}
+
+# Fix  fior ALDEx2
+remove.packages("ALDEx2")
+install.packages("archive.bioconductor.org_packages_3.15_bioc_src_contrib_Archive_ALDEx2_ALDEx2_1.28.0.tar.gz", repos = NULL, type="source")
+library(ALDEx2)
+
+# If you want to analyze the abundance of KEGG pathways instead of KO within the pathway, please set `ko_to_kegg` to TRUE.
+# KEGG pathways typically have more descriptive explanations.
+
+library(readr)
+library(ggpicrust2)
+library(tibble)
+library(tidyverse)
+library(ggprism)
+library(patchwork)
+# Load necessary data: abundance data and metadata
+
+metadata <- read_delim(
+    "K://PhD/data/WP2_microbial/GFZ_RNA_DNA/MERIT_RNA_repo/metadata.txt",
+    delim = "\t",
+    escape_double = FALSE,
+    trim_ws = TRUE
+)
+
+# Load KEGG pathway abundance
+# data(kegg_abundance)
+file_path_all <- "K:/PhD/data/WP2_microbial/GFZ_RNA_DNA/MERIT_RNA_repo/pathway_prediction_raw.txt"
+file_path_PZ <- "K:/PhD/data/WP2_microbial/GFZ_RNA_DNA/MERIT_RNA_repo/pathway_prediction_PZ.txt"
+file_path_LM <- "K:/PhD/data/WP2_microbial/GFZ_RNA_DNA/MERIT_RNA_repo/pathway_prediction_LM.txt"
+file_path_HM <- "K:/PhD/data/WP2_microbial/GFZ_RNA_DNA/MERIT_RNA_repo/pathway_prediction_HM.txt"
+
+kegg_abundance <- read_delim(file_path_all, delim = "\t")
+kegg_abundance_PZ <- read_delim(file_path_PZ, delim = "\t")
+kegg_abundance_LM <- read_delim(file_path_LM, delim = "\t")
+kegg_abundance_HM <- read_delim(file_path_HM, delim = "\t")
+
+## PCA Plots pathway analysis
+plot_pca_kegg<-pathway_pca(abundance = kegg_abundance , metadata = metadata, group = "Treatment") 
+plot_pca_kegg_PZ<-pathway_pca(abundance = kegg_abundance_PZ, metadata = metadata, group = "Treatment") 
+plot_pca_kegg_LM<-pathway_pca(abundance = kegg_abundance_LM , metadata = metadata, group = "Treatment") 
+plot_pca_kegg_HM<-pathway_pca(abundance = kegg_abundance_HM, metadata = metadata, group = "Treatment") 
+
+plot_pca_kegg
+plot_pca_kegg_PZ
+plot_pca_kegg_LM
+plot_pca_kegg_HM
+```
+## Step 2b: DESeq 2 referenced to ambient T
+```{r}
+# Ensure the reference level is set correctly
+dds$Treatment <- relevel(dds$Treatment, ref = "ambient")
+
+# Run DESeq analysis
+dds <- DESeq(dds)
+
+# Extract results for +1.5°C vs ambient
+res_1.5 <- results(dds, contrast = c("Treatment", "1.5", "ambient"))
+res_1.5 <- res_1.5[order(res_1.5$padj), ]  
+
+# Extract results for +3.0°C vs ambient
+res_3.0 <- results(dds, contrast = c("Treatment", "3", "ambient"))
+res_3.0 <- res_3.0[order(res_3.0$padj), ]  
+
+# Plot for +1.5°C vs ambient
+par(mfrow = c(1, 2))  
+
+with(res_1.5, plot(log2FoldChange, -log10(pvalue), pch = 20, 
+                   main = "+1.5°C vs Ambient", xlim = c(-3, 3), col = "gray"))
+with(subset(res_1.5, padj < 0.01), points(log2FoldChange, -log10(pvalue), 
+                                          pch = 20, col = "blue"))
+with(subset(res_1.5, padj < 0.05 & abs(log2FoldChange) > 1), points(log2FoldChange, 
+                                                                   -log10(pvalue), pch = 20, col = "red"))
+
+# Plot for +3.0°C vs ambient
+with(res_3.0, plot(log2FoldChange, -log10(pvalue), pch = 20, 
+                   main = "+3.0°C vs Ambient", xlim = c(-3, 3), col = "gray"))
+with(subset(res_3.0, padj < 0.01), points(log2FoldChange, -log10(pvalue), 
+                                          pch = 20, col = "blue"))
+with(subset(res_3.0, padj < 0.05 & abs(log2FoldChange) > 1), points(log2FoldChange, 
+                                                                   -log10(pvalue), pch = 20, col = "red"))
+
+par(mfrow = c(1, 1))
+```
+
+
+
+## Step 2b: DESeq 2 referenced to ambient T ggplot2
+```{r}
+# Function to create a volcano plot
+create_volcano_plot <- function(res, title) {
+  df <- as.data.frame(res)
+  df$significant <- ifelse(df$padj < 0.05 & abs(df$log2FoldChange) > 1, "High", 
+                           ifelse(df$padj < 0.01, "Medium", "Low"))
+  
+  ggplot(df, aes(x = log2FoldChange, y = -log10(pvalue), color = significant)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    scale_color_manual(values = c("High" = "red", "Medium" = "blue", "Low" = "gray")) +
+    xlim(-3, 3) +
+    ylim(0, 11) +
+    labs(title = title,
+         x = "log2 Fold Change",
+         y = "-log10 p-value") +
+    theme_minimal() +
+    theme(legend.position = "none")
+}
+
+# Create plots
+plot_1.5 <- create_volcano_plot(res_1.5, "+1.5°C vs Ambient")
+plot_3.0 <- create_volcano_plot(res_3.0, "+3.0°C vs Ambient")
+
+# Arrange plots side by side
+grid.arrange(plot_1.5, plot_3.0, ncol = 2)
+```
+
+```{r}
+# Check for missing information on different levels (Is there missing Genus or Phylum). Do we have negative counts
+any(is.na(master_df$Genus))
+any(is.na(master_df$Phylum))
+any(is.na(master_df$count) | master_df$count < 0)
+
+# Transfrom count into numeric format
+master_df$count <- as.numeric(master_df$count)
+
+# Create a new dataframe which is sorted by asv
+df_asv <- reshape(data=master_df,  # Name des Datensatzes
+                       v.names="count",
+                       timevar= "asv",
+                       idvar="Sample_ID", 
+                       direction="wide")
+# Exclude both MOCK communities (X138, X139) as well as the negative-DNA (X136) and negative-PCR (X137) controls
+df_asv <- subset(df_asv, Sample_ID != "X136" & Sample_ID != "X137" & Sample_ID != "X138" & Sample_ID != "X139")
+
+# Transform all coloumns with factors to factors and all Genus coloumns to numeric
+df_asv <- df_asv %>%
+  mutate_at(c(1:18), as.factor)
+
+# Create a new dataframe which is sorted by Genus
+df_gen <- reshape(data=master_df,  # Name des Datensatzes
+                       v.names="count",
+                       timevar= "Genus",
+                       idvar="Sample_ID", 
+                       direction="wide")
+# Exclude both MOCK communities (X138, X139) as well as the negative-DNA (X136) and negative-PCR (X137) controls
+df_gen <- subset(df_gen, Sample_ID != "X136" & Sample_ID != "X137" & Sample_ID != "X138" & Sample_ID != "X139")
+
+# Transform all coloumns with factors to factors and all Genus coloumns to numeric
+df_genus <- df_gen %>%
+  mutate_at(c(1:18), as.factor)
+```
+
+## Step 2b: Subset DESeq 2
+```{r}
+# Subset by Zone: PZ
+dds_PZ <- dds[, dds$Zone == "PZ"]
+dds_PZ <- DESeq(dds_PZ)
+vsd_PZ <- varianceStabilizingTransformation(dds_PZ, blind = TRUE)
+
+# Subset by Zone: LM
+dds_LM <- dds[, dds$Zone == "LM"]
+dds_LM <- DESeq(dds_LM)
+vsd_LM <- varianceStabilizingTransformation(dds_LM, blind = TRUE)
+
+# Subset by Zone: HM
+dds_HM <- dds[, dds$Zone == "HM"]
+dds_HM <- DESeq(dds_HM)
+vsd_HM <- varianceStabilizingTransformation(dds_HM, blind = TRUE)
+
+# Function for Analysis and Plotting
+analyze_and_plot <- function(dds_subset, title_suffix) {
+  dds_subset$Treatment <- relevel(dds_subset$Treatment, ref = "ambient")
+  
+  # Extract results for +1.5°C vs ambient
+  res_1.5 <- results(dds_subset, contrast = c("Treatment", "1.5", "ambient"))
+  res_1.5 <- res_1.5[order(res_1.5$padj), ]
+  
+  # Extract results for +3.0°C vs ambient
+  res_3.0 <- results(dds_subset, contrast = c("Treatment", "3", "ambient"))
+  res_3.0 <- res_3.0[order(res_3.0$padj), ]
+  
+  # Plot results
+  par(mfrow = c(1, 2))  # Arrange plots side by side
+  
+  # +1.5°C vs ambient
+  with(res_1.5, plot(log2FoldChange, -log10(pvalue), pch = 20, 
+                     main = paste("+1.5°C vs Ambient -", title_suffix), 
+                     xlim = c(-3, 3), col = "gray"))
+  with(subset(res_1.5, padj < 0.01), points(log2FoldChange, -log10(pvalue), 
+                                            pch = 20, col = "blue"))
+  with(subset(res_1.5, padj < 0.05 & abs(log2FoldChange) > 1), points(log2FoldChange, 
+                                                                     -log10(pvalue), pch = 20, col = "red"))
+  # +3.0°C vs ambient
+  with(res_3.0, plot(log2FoldChange, -log10(pvalue), pch = 20, 
+                     main = paste("+3.0°C vs Ambient -", title_suffix), 
+                     xlim = c(-3, 3), col = "gray"))
+  with(subset(res_3.0, padj < 0.01), points(log2FoldChange, -log10(pvalue), 
+                                            pch = 20, col = "blue"))
+  with(subset(res_3.0, padj < 0.05 & abs(log2FoldChange) > 1), points(log2FoldChange, 
+                                                                     -log10(pvalue), pch = 20, col = "red"))
+  par(mfrow = c(1, 1))
+}
+
+# Run analysis and plotting for each subset
+analyze_and_plot(dds_PZ, "PZ")
+analyze_and_plot(dds_LM, "LM")
+analyze_and_plot(dds_HM, "HM")
+```
+
+## Step 2e: Subset DESeq 2 ggplot2
+```{r}
+create_volcano_plot <- function(res, title) {
+  df <- as.data.frame(res)
+  df$significant <- ifelse(df$padj < 0.05, 
+                           ifelse(df$log2FoldChange < 0, "Down", "Up"), 
+                           "Not Significant")
+  
+  ggplot(df, aes(x = log2FoldChange, y = -log10(pvalue), color = significant)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    scale_color_manual(values = c("Down" = "blue", "Up" = "red", "Not Significant" = "gray")) +
+    xlim(-3, 3) +
+    ylim(0, 6) +
+    labs(title = title,
+         x = "log2 Fold Change",
+         y = "-log10 p-value") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+
+analyze_and_plot <- function(dds_subset, title_suffix) {
+  dds_subset$Treatment <- relevel(dds_subset$Treatment, ref = "ambient")
+  
+  res_1.5 <- results(dds_subset, contrast = c("Treatment", "1.5", "ambient"))
+  res_1.5 <- res_1.5[order(res_1.5$padj), ]
+  
+  res_3.0 <- results(dds_subset, contrast = c("Treatment", "3", "ambient"))
+  res_3.0 <- res_3.0[order(res_3.0$padj), ]
+  
+  plot_1.5 <- create_volcano_plot(res_1.5, paste("+1.5°C vs Ambient -", title_suffix))
+  plot_3.0 <- create_volcano_plot(res_3.0, paste("+3.0°C vs Ambient -", title_suffix))
+  
+  grid.arrange(plot_1.5, plot_3.0, ncol = 2)
+}
+
+plots_PZ <- analyze_and_plot(dds_PZ, "PZ")
+plots_LM <- analyze_and_plot(dds_LM, "LM")
+plots_HM <- analyze_and_plot(dds_HM, "HM")
+
+grid.arrange(plots_PZ, plots_LM, plots_HM, ncol = 1)
+```
+
+
+
+
+```{r}
+# Function to get the most detailed taxonomic information
+get_detailed_taxonomy <- function(asv_id, asv_data) {
+  tax_ranks <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus")
+  tax_info <- asv_data[asv_id, tax_ranks]
+  
+  for (rank in rev(tax_ranks)) {
+    if (!is.na(tax_info[rank]) && tax_info[rank] != "") {
+      return(paste(rank, tax_info[rank], sep=": "))
+    }
+  }
+  return(asv_id)  # Return ASV ID if no taxonomy info available
+}
+
+# Function to get significant ASVs and prepare data
+prepare_sig_asvs_data <- function(vsd, dds, asv_data, alpha = 0.05) {
+  # Get results for all comparisons
+  res_1.5 <- results(dds, contrast = c("Treatment", "1.5", "ambient"))
+  res_3.0 <- results(dds, contrast = c("Treatment", "3", "ambient"))
+  
+  # Combine significant ASVs from both comparisons
+  sig_asvs <- unique(c(
+    rownames(res_1.5)[which(res_1.5$padj < alpha)],
+    rownames(res_3.0)[which(res_3.0$padj < alpha)]
+  ))
+  
+  if(length(sig_asvs) == 0) {
+    return(NULL)  # Return NULL if no significant ASVs
+  }
+  
+  # Subset data for significant ASVs
+  sig_data <- assay(vsd)[sig_asvs, ]
+  
+  row_names <- sapply(sig_asvs, get_detailed_taxonomy, asv_data)
+  rownames(sig_data) <- row_names
+  
+  df_annot <- as.data.frame(colData(dds)[, c("Zone", "Treatment")])
+  df_annot$Treatment <- factor(df_annot$Treatment, levels = c("ambient", "1.5", "3"))
+  
+  sample_order <- order(df_annot$Treatment)
+  sig_data_ordered <- sig_data[, sample_order]
+  df_annot_ordered <- df_annot[sample_order, ]
+  
+  return(list(data = sig_data_ordered, annot = df_annot_ordered))
+}
+
+# Prepare data for all zones
+data_HM <- prepare_sig_asvs_data(vsd_HM, dds_HM, asv)
+data_LM <- prepare_sig_asvs_data(vsd_LM, dds_LM, asv)
+data_PZ <- prepare_sig_asvs_data(vsd_PZ, dds_PZ, asv)
+
+# Calculate common color scale for non-null datasets
+all_values <- c()
+for(data in list(data_HM, data_LM, data_PZ)) {
+  if(!is.null(data)) {
+    all_values <- c(all_values, data$data)
+  }
+}
+color_breaks <- seq(min(all_values), max(all_values), length.out = 100)
+
+# Define custom colors for Treatment
+treatment_colors <- c("ambient" = "#4575B4", "1.5" = "#FDAE61", "3" = "#D73027")
+
+# Function to plot heatmap with common color scale and custom annotation colors
+plot_heatmap <- function(data, annot, zone_name, color_breaks, treatment_colors) {
+  if(is.null(data)) {
+    cat("No significant ASVs found for", zone_name, "\n")
+    return(NULL)
+  }
+  pheatmap(data,
+           cluster_rows = TRUE,
+           show_rownames = TRUE,
+           cluster_cols = FALSE,
+           annotation_col = annot,
+           annotation_colors = list(Treatment = treatment_colors),
+           main = paste("Significant ASVs -", zone_name),
+           breaks = color_breaks)
+}
+
+# Plot heatmaps for each zone with common color scale and custom annotation colors
+plot_heatmap(data_HM$data, data_HM$annot, "High Marsh", color_breaks, treatment_colors)
+plot_heatmap(data_LM$data, data_LM$annot, "Low Marsh", color_breaks, treatment_colors)
+plot_heatmap(data_PZ$data, data_PZ$annot, "Pioneer Zone", color_breaks, treatment_colors)
+
+
+
+# Function to check and correct sample assignments
+correct_sample_assignments <- function(dds) {
+  # Get the sample names from the count data
+  count_samples <- colnames(counts(dds))
+  
+  # Get the sample names from colData
+  coldata_samples <- rownames(colData(dds))
+  
+  # Check if they match
+  if (!all(count_samples == coldata_samples)) {
+    warning("Sample names in counts and colData do not match. Attempting to correct...")
+    
+    # Reorder colData to match count data
+    colData(dds) <- colData(dds)[count_samples,]
+  }
+  
+  return(dds)
+}
+
+# Apply the correction to each DDS object
+dds_HM <- correct_sample_assignments(dds_HM)
+dds_LM <- correct_sample_assignments(dds_LM)
+dds_PZ <- correct_sample_assignments(dds_PZ)
+
+```
+
+## Step 2e: DESeq 2 Gene changes
+```{r}
+# Function to extract and plot top genes for each Zone and Treatment comparison
+analyze_top_genes <- function(dds_subset, zone_name, contrast, n_top = 6) {
+  # Extract results for the given contrast
+  res <- results(dds_subset, contrast = contrast)
+  res <- res[order(res$padj), ]  # Sort by adjusted p-value
+  
+  # Select the most relevant genes (highest absolute log2FoldChange)
+  res <- as.data.frame(res)
+  res$ASV <- rownames(res)  # Add ASV names
+  top_genes <- res %>%
+    filter(!is.na(padj)) %>%  # Remove rows with NA padj
+    arrange(desc(abs(log2FoldChange))) %>%  # Sort by absolute log2FoldChange
+    head(n_top)  # Take the top n genes
+  
+  # Display top genes
+  print(paste("Top genes for", zone_name, "(", paste(contrast, collapse = " vs "), "):"))
+  print(top_genes[, c("ASV", "log2FoldChange", "padj")])
+  
+  # Plot counts for top genes
+  par(mfrow = c(2, 3))  # Adjust plotting layout
+  for (gene in top_genes$ASV) {
+    plotCounts(dds_subset, gene = gene, intgroup = "Treatment",
+               main = paste("Gene:", gene))
+  }
+  par(mfrow = c(1, 1))  # Reset plotting layout
+}
+
+# Subset and analyze each Zone
+for (zone in levels(metaData$Zone)) {
+  dds_zone <- dds[, dds$Zone == zone]  # Subset the DESeqDataSet for the Zone
+  dds_zone <- DESeq(dds_zone)  # Run DESeq for the subset
+  
+  # Analyze for +1.5°C vs ambient
+  analyze_top_genes(dds_zone, zone_name = zone, contrast = c("Treatment", "1.5", "ambient"))
+  
+  # Analyze for +3.0°C vs ambient
+  analyze_top_genes(dds_zone, zone_name = zone, contrast = c("Treatment", "3", "ambient"))
+}
+
+```
+
+```{r}
+# High Marsh
+assay_data_HM <- assay(vsd_HM)
+row_vars_HM <- apply(assay_data_HM, 1, var)
+top_10_asvs_HM <- names(sort(row_vars_HM, decreasing = TRUE)[1:10])
+top_10_data_HM <- assay_data_HM[top_10_asvs_HM, ]
+
+data_HM <- top_10_data_HM %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  pivot_longer(cols = -ASV, names_to = "Sample", values_to = "Abundance")
+
+data_HM$Treatment <- factor(colData(dds_HM)$Treatment[match(data_HM$Sample, colnames(assay_data_HM))])
+
+# Plot High Marsh
+plot_HM <- ggplot(data_HM, aes(x = Sample, y = ASV, fill = Abundance)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  facet_grid(~ Treatment, scales = "free_x", space = "free_x") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.title.x = element_blank(),
+        panel.grid = element_blank()) +
+  labs(title = "Top 10 ASVs - High Marsh", y = "ASV", fill = "Abundance")
+
+print(plot_HM)
+
+# Low Marsh
+assay_data_LM <- assay(vsd_LM)
+row_vars_LM <- apply(assay_data_LM, 1, var)
+top_10_asvs_LM <- names(sort(row_vars_LM, decreasing = TRUE)[1:10])
+top_10_data_LM <- assay_data_LM[top_10_asvs_LM, ]
+
+data_LM <- top_10_data_LM %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  pivot_longer(cols = -ASV, names_to = "Sample", values_to = "Abundance")
+
+data_LM$Treatment <- factor(colData(dds_LM)$Treatment[match(data_LM$Sample, colnames(assay_data_LM))])
+
+# Plot Low Marsh
+plot_LM <- ggplot(data_LM, aes(x = Sample, y = ASV, fill = Abundance)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  facet_grid(~ Treatment, scales = "free_x", space = "free_x") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.title.x = element_blank(),
+        panel.grid = element_blank()) +
+  labs(title = "Top 10 ASVs - Low Marsh", y = "ASV", fill = "Abundance")
+
+print(plot_LM)
+
+# Pioneer Zone
+assay_data_PZ <- assay(vsd_PZ)
+row_vars_PZ <- apply(assay_data_PZ, 1, var)
+top_10_asvs_PZ <- names(sort(row_vars_PZ, decreasing = TRUE)[1:10])
+top_10_data_PZ <- assay_data_PZ[top_10_asvs_PZ, ]
+
+data_PZ <- top_10_data_PZ %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  pivot_longer(cols = -ASV, names_to = "Sample", values_to = "Abundance")
+
+data_PZ$Treatment <- factor(colData(dds_PZ)$Treatment[match(data_PZ$Sample, colnames(assay_data_PZ))])
+
+# Plot Pioneer Zone
+plot_PZ <- ggplot(data_PZ, aes(x = Sample, y = ASV, fill = Abundance)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  facet_grid(~ Treatment, scales = "free_x", space = "free_x") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.title.x = element_blank(),
+        panel.grid = element_blank()) +
+  labs(title = "Top 10 ASVs - Pioneer Zone", y = "ASV", fill = "Abundance")
+
+print(plot_PZ)
+```
+
+# Step 7: Bubble Plots
+## Step 7a: Family table transformation
+```{r}
+# Remove specified samples
+samples_to_remove <- c("X136", "X137", "X138", "X139")
+tab_fam_filtered <- tab_fam %>%
+  select(-all_of(samples_to_remove))
+
+## Transform and filter data
+tab_fam_long <- tab_fam_filtered %>%
+  pivot_longer(cols = -1, names_to = "Sample_ID", values_to = "Count") %>%
+  rename(full_taxonomy = 1) %>%
+  filter(!str_ends(full_taxonomy, "others;")) %>%
+  filter(!str_ends(full_taxonomy, "others")) %>%
+  mutate(last_taxa = str_extract(full_taxonomy, "[^;]+$"))
+
+# Merge with metadata and calculate relative abundance
+tab_fam_agg <- tab_fam_long %>%
+  left_join(metadata, by = "Sample_ID") %>%
+  group_by(Sample_ID) %>%
+  mutate(TotalCount = sum(Count)) %>%
+  group_by(last_taxa, Treatment, Zone) %>%
+  summarise(RelativeAbundance = sum(Count) / sum(TotalCount), .groups = "drop")
+
+# Select top N most abundant families
+N <- 25  # Change this to the number of top families you want to show
+top_families <- tab_fam_agg %>%
+  group_by(last_taxa) %>%
+  summarise(TotalRelativeAbundance = sum(RelativeAbundance)) %>%
+  top_n(N, TotalRelativeAbundance) %>%
+  pull(last_taxa)
+
+# Filter for top families
+tab_fam_agg_filtered <- tab_fam_agg %>%
+  filter(last_taxa %in% top_families)
+
+# Set factor levels for Zone and Treatment
+tab_fam_agg_filtered$Zone <- factor(tab_fam_agg_filtered$Zone, levels = c("PZ", "LM", "HM"))
+tab_fam_agg_filtered$Treatment <- recode_factor(tab_fam_agg_filtered$Treatment, "ambient" = "ambient", "1.5" = "+1.5°C", "3"  = "+3.0°C")
+
+# Create the bubble plot
+plot_bubble_fam <- ggplot(tab_fam_agg_filtered, aes(x = Treatment, y = last_taxa, size = RelativeAbundance, color = Treatment)) +
+  geom_point(alpha = 0.7) +
+  scale_size(range = c(1, 10), name = "Relative Abundance") +
+  scale_color_manual(values = c("ambient" = "#4575B4", "+1.5°C" = "#FDAE61", "+3.0°C" = "#D73027")) +
+  facet_grid(. ~ Zone, scales = "free_x", space = "free_x") +
+  theme_JM +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        strip.placement = "outside") +
+  labs(x = NULL, y = NULL, title = "")
+
+# Summary table of most abundant families
+top_families_summary <- tab_fam_agg_filtered %>%
+  group_by(last_taxa) %>%
+  summarise(MeanRelativeAbundance = mean(RelativeAbundance)) %>%
+  arrange(factor(last_taxa)) %>%
+  slice_head(n = 25)
+
+# Write the summary table to a CSV file
+write.csv(top_families_summary, "df_top_25_families.csv", row.names = FALSE)
+
+# All plots
+plot_bubble_fam
+```
+
+# NMDS Plot
+```{r,  message=FALSE, warning=FALSE}
+# Set color parameters
+polygon_colors      <-  c("blue","#FDAE61","#D73027") 
+my_palette <- c("#4575B4", "#FDAE61", "#D73027")
+my_palette2 <- c("tan", "darkgreen", "lightgreen")
+# Build matrix used for NMDS Plots (Plot https://jkzorz.github.io/2019/06/06/NMDS.html)
+com = df_asv[,20:ncol(df_asv)]
+m_com = as.matrix(com)
+
+# Transform matrix values to be numeric and remove any NAs
+m_com <- apply(m_com, 2, as.numeric)
+any(is.na(m_com))
+m_com <- m_com[complete.cases(m_com), ]
+any(is.na(m_com))
+m_com <- na.omit(m_com)
+
+set.seed(123)
+nmds = metaMDS(m_com, distance = "bray", na.rm = TRUE)
+nmds  # Stress is 0.186 
+plot(nmds)
+
+# Build matrix used for NMDS Plot on Zone specific subsets
+df_asv_PZ <- df_asv%>%
+  filter(Zone =="PZ")
+
+com_PZ = df_asv_PZ[,20:ncol(df_asv_PZ)]
+m_com_PZ = as.matrix(com_PZ)
+
+set.seed(123)
+nmds_PZ = metaMDS(m_com_PZ, distance = "bray", na.rm = TRUE)
+nmds_PZ  # Stress is 0.1536 
+plot(nmds_PZ)
+
+# Adjust factors for correct/desired order in plots
+nmds_data           <- data.frame(nmds$points, Depth = df_asv$Depth, Treatment = df_asv$Treatment, Zone = df_asv$Zone)
+nmds_data_PZ           <- data.frame(nmds_PZ$points, Depth = df_asv_PZ$Depth, Treatment = df_asv_PZ$Treatment)
+
+nmds_data$Depth     <- factor(nmds_data$Depth, levels = c("0-5 cm", "5-10 cm", "20-30 cm", "40-50 cm", "80-100 cm"))
+nmds_data$Treatment <- as.factor(nmds_data$Treatment)
+nmds_data$Zone      <- factor(nmds_data$Zone, levels = c("PZ","LM","HM"))
+nmds_data$Treatment <- recode_factor(nmds_data$Treatment,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+
+nmds_data_PZ$Depth     <- factor(nmds_data_PZ$Depth, levels = c("0-5 cm", "5-10 cm", "20-30 cm", "40-50 cm", "80-100 cm"))
+nmds_data_PZ$Treatment <- recode_factor(nmds_data_PZ$Treatment,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+
+# NMDS Treatment*Zone
+plot_MDS1<-ggplot(nmds_data, aes(x = MDS1, y = MDS2)) +
+  geom_point(size=3, aes( shape = Zone, colour = Treatment))+ 
+  stat_ellipse(type = "t", level = 0.95, geom = "polygon", aes(fill = Treatment), alpha = 0.2) +
+  scale_fill_manual(values = polygon_colors,name = "Warming treatment:") +
+  theme_JM+
+  xlab("NMDS 1")+
+  ylab("NMDS 2")+
+  scale_colour_manual(values = c("#4575B4", "#FDAE61","#D73027"),name = "Warming treatment:")+
+  facet_grid(~Zone)
+
+# NMDS Treatment*Zone*Depth
+plot_MDS2<-ggplot(nmds_data, aes(x = MDS1, y = MDS2)) +
+  geom_point(size=3, aes( shape = Zone, colour = Treatment))+ 
+  stat_ellipse(type = "t", level = 0.95, geom = "polygon", aes(fill = Treatment), alpha = 0.2) +
+  scale_fill_manual(values = polygon_colors) +
+  theme_JM+
+  scale_colour_manual(values = c("#4575B4", "#FDAE61","#D73027"), name = "Warming treatment:")+
+  facet_grid(~Depth)
+
+# NMDS Treatment*Zone*Depth v. 2
+plot_MDS3<-ggplot(nmds_data, aes(x = MDS1, y = MDS2)) +
+  geom_point(size=3, aes( shape = Zone, colour = Treatment))+ 
+  stat_ellipse(type = "t", level = 0.95, geom = "polygon", aes(fill = Treatment), alpha = 0.2) +
+  scale_fill_manual(values = polygon_colors) +
+  theme_JM+
+  scale_colour_manual(values = c("#4575B4", "#FDAE61","#D73027"))+
+  facet_wrap(~Zone*Depth, ncol=5)
+
+# NMDS PZ subset 
+plot_MDS_PZ<-ggplot(nmds_data_PZ, aes(x = MDS1, y = MDS2)) +
+  geom_point(size=3, aes( shape = Treatment, colour = Treatment))+ 
+  stat_ellipse(type = "t", level = 0.95, geom = "polygon", aes(fill = Treatment), alpha = 0.2) +
+  scale_fill_manual(values = polygon_colors) +
+  theme_JM+
+  scale_colour_manual(values = c("#4575B4", "#FDAE61","#D73027"))+
+  facet_grid(~Depth)
+
+plot_MDS1
+plot_MDS2
+plot_MDS3
+plot_MDS_PZ
+```
+\pagebreak
+# Statistical testing - PERMANOVA
+```{r,  message=FALSE, warning=FALSE}
+permanova <- adonis2(m_com ~ Zone*Treatment*Depth, data = df_asv, permutations = 999)
+permanova
+
+# Run pairwise PERMANOVA tests
+pairwise_perm <- pairwise.adonis2(m_com ~ Treatment*Zone*Depth, data = df_asv, 
+                                  distance = "bray", method = "bray",
+                                  p.adjust.method = "BH", permutations = 999)
+
+# Run pairwise PERMANOVA tests for each factor
+pairwise_perm_Zone <- pairwise.adonis2(m_com ~ Zone, data = df_asv, 
+                                       distance = "bray", method = "bray",
+                                       p.adjust.method = "BH", permutations = 999)
+pairwise_perm_Treatment <- pairwise.adonis2(m_com ~ Treatment, data = df_asv, 
+                                            distance = "bray", method = "bray",
+                                            p.adjust.method = "BH", permutations = 999)
+pairwise_perm_Depth <- pairwise.adonis2(m_com ~ Depth, data = df_asv, 
+                                        distance = "bray", method = "bray",
+                                        p.adjust.method = "BH", permutations = 999)
+
+pairwise_perm_Treatment_PZ <- pairwise.adonis2(m_com_PZ ~ Treatment*Depth, data = df_asv_PZ, 
+                                            distance = "bray", method = "bray",
+                                            p.adjust.method = "BH", permutations = 999)
+#pairwise_perm_Treatment_LM <- pairwise.adonis2(m_com_LM ~ Treatment, data = df_asv_PZ, 
+#                                            distance = "bray", method = "bray",
+ #                                           p.adjust.method = "BH", permutations = 999)
+#pairwise_perm_Treatment_HM <- pairwise.adonis2(m_com_HM ~ Treatment, data = df_asv_PZ, 
+  #                                          distance = "bray", method = "bray",
+   #                                         p.adjust.method = "BH", permutations = 999)
+
+# Results
+pairwise_perm
+pairwise_perm_Zone
+pairwise_perm_Treatment
+pairwise_perm_Depth
+pairwise_perm_Treatment_PZ
+```
+
+# Bubble Plots
+```{r,  message=FALSE, warning=FALSE}
+#Transform asv table into long-format. Transformation will catch all headers (sample names) into a new coloumn (Sample_ID). This is done for all dataframes (Phylum, Order, Genus)
+taxa_sum_Phylum <- taxa_sum_Phylum %>%                      
+  gather(key = "Sample_ID", value = "count",X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17, X18, X19, X20, X21, X22, X23, X24, X25, X26, X27, X28, X29, X30, X31, X32, X33, X34, X35, X36, X37, X38, X39, X40, X41, X42, X43, X44, X45, X46, X47, X48, X49, X50, X51, X52, X53, X54, X55, X56, X57, X58, X59, X60, X61, X62, X63, X64, X65, X66, X67, X68, X69, X70, X71, X72, X73, X74, X75, X76, X77, X78, X79, X80, X81, X82, X83, X84, X85, X86, X87, X88, X89, X90, X91, X92, X93, X94, X95, X96, X97, X98, X99, X100, X101, X102, X103, X104, X105, X106, X107, X108, X109, X110, X111, X112, X113, X114, X115, X116, X117, X118, X119, X120, X121, X122, X123, X124, X125, X126, X127, X128, X129, X130, X131, X132, X133, X134, X135, X136, X137, X138, X139)
+
+taxa_sum_Order <- taxa_sum_Order %>%                      
+  gather(key = "Sample_ID", value = "count",X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17, X18, X19, X20, X21, X22, X23, X24, X25, X26, X27, X28, X29, X30, X31, X32, X33, X34, X35, X36, X37, X38, X39, X40, X41, X42, X43, X44, X45, X46, X47, X48, X49, X50, X51, X52, X53, X54, X55, X56, X57, X58, X59, X60, X61, X62, X63, X64, X65, X66, X67, X68, X69, X70, X71, X72, X73, X74, X75, X76, X77, X78, X79, X80, X81, X82, X83, X84, X85, X86, X87, X88, X89, X90, X91, X92, X93, X94, X95, X96, X97, X98, X99, X100, X101, X102, X103, X104, X105, X106, X107, X108, X109, X110, X111, X112, X113, X114, X115, X116, X117, X118, X119, X120, X121, X122, X123, X124, X125, X126, X127, X128, X129, X130, X131, X132, X133, X134, X135, X136, X137, X138, X139)
+
+taxa_sum_Genus <- taxa_sum_Genus %>%                      
+  gather(key = "Sample_ID", value = "count",X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17, X18, X19, X20, X21, X22, X23, X24, X25, X26, X27, X28, X29, X30, X31, X32, X33, X34, X35, X36, X37, X38, X39, X40, X41, X42, X43, X44, X45, X46, X47, X48, X49, X50, X51, X52, X53, X54, X55, X56, X57, X58, X59, X60, X61, X62, X63, X64, X65, X66, X67, X68, X69, X70, X71, X72, X73, X74, X75, X76, X77, X78, X79, X80, X81, X82, X83, X84, X85, X86, X87, X88, X89, X90, X91, X92, X93, X94, X95, X96, X97, X98, X99, X100, X101, X102, X103, X104, X105, X106, X107, X108, X109, X110, X111, X112, X113, X114, X115, X116, X117, X118, X119, X120, X121, X122, X123, X124, X125, X126, X127, X128, X129, X130, X131, X132, X133, X134, X135, X136, X137, X138, X139)
+
+# Merge asv table with metadata file to create a master dataframe (master_df)
+taxa_sum_Phylum <- merge(taxa_sum_Phylum, metadata, by = "Sample_ID", all = TRUE)
+taxa_sum_Order  <- merge(taxa_sum_Order , metadata, by = "Sample_ID", all = TRUE)
+taxa_sum_Genus  <- merge(taxa_sum_Genus , metadata, by = "Sample_ID", all = TRUE)
+
+# Exclude both MOCK communities (X138, X139) as well as the negative-DNA (X136) and negative-PCR (X137) controls
+taxa_sum_Phylum <- subset(taxa_sum_Phylum, Sample_ID != "X136" & Sample_ID != "X137" & Sample_ID != "X138" & Sample_ID != "X139")
+taxa_sum_Order  <- subset(taxa_sum_Order , Sample_ID != "X136" & Sample_ID != "X137" & Sample_ID != "X138" & Sample_ID != "X139")
+taxa_sum_Genus  <- subset(taxa_sum_Genus , Sample_ID != "X136" & Sample_ID != "X137" & Sample_ID != "X138" & Sample_ID != "X139")
+
+# Transform all coloumns with factors to factors and all Genus coloumns to numeric
+taxa_sum_Phylum <- taxa_sum_Phylum %>%
+  mutate_at(c(4:14), as.factor)%>%
+  mutate_at(c(3), as.numeric)
+
+taxa_sum_Order <- taxa_sum_Order%>%
+  mutate_at(c(4:14), as.factor)%>%
+  mutate_at(c(3), as.numeric)
+
+taxa_sum_Genus <- taxa_sum_Genus%>%
+  mutate_at(c(4:14), as.factor)%>%
+  mutate_at(c(3), as.numeric)
+
+# Create individual coloumns for the rank information currently stored in one coloumn "taxa"
+taxa_sum_Order <- separate(taxa_sum_Order, taxa, into = c("Kingdom", "Phylum", "Class", "Order"), sep = ";", remove = FALSE)
+taxa_sum_Genus <- separate(taxa_sum_Genus, taxa, into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus"), sep = ";", remove = FALSE)
+
+# Bubble plots for Phylum level
+taxa_sum_Phylum$Treatment <- recode_factor(taxa_sum_Phylum$Treatment ,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+
+taxa_sum_Phylum_all<- taxa_sum_Phylum %>%
+  group_by(Zone, Treatment, taxa, Depth) %>%
+  summarize(count = sum(count))
+
+plot_Bubble_Phylum <-  ggplot(taxa_sum_Phylum_all, aes(x=Treatment, y=taxa, size=count)) +
+  geom_point(alpha=0.7, show.legend =FALSE) +
+  scale_size(range=c(2, 10)) +
+  labs(x = "Phylum-Zone", y = "Relative abundance", title = "Relative abundance of microbial species") +
+  theme_pubclean()
+
+plot_Bubble_Phylum + facet_grid(~Zone*Depth)
+
+# Filter phyla with less than 1 count
+filtered_taxa_sum_Phylum<- taxa_sum_Phylum %>%
+  group_by(Zone, Treatment, taxa, Depth) %>%
+  summarize(count = sum(count)) %>%
+ filter(count >= 1) 
+  
+
+filtered_taxa_sum_Phylum$Depth     <- factor(filtered_taxa_sum_Phylum$Depth, levels = c("0-5 cm", "5-10 cm", "20-30 cm", "40-50 cm", "80-100 cm"))
+filtered_taxa_sum_Phylum$Zone    <- factor(filtered_taxa_sum_Phylum$Zone, levels = c("PZ","LM","HM"))
+
+plot_Bubble_Phylum2 <-  ggplot(filtered_taxa_sum_Phylum, aes(x=Treatment, y=taxa, size=count, color=taxa)) +
+  geom_point(alpha=0.7, show.legend =FALSE) +
+  scale_size(range=c(2, 10)) +
+  labs(x = "Phylum-Zone", y = "Relative abundance", title = "Relative abundance of microbial species") +
+  theme_JM+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plot_Bubble_Phylum2 + facet_grid(~Zone*Depth)
+
+# Bubble plots for Order dataframe with specific phylum levels
+sum_proteo <- taxa_sum_Order %>% filter(Phylum == "Proteobacteria")
+sum_proteo <- sum_proteo %>%
+  group_by(Zone, Treatment, Depth,Kingdom, Phylum, Class, Order) %>%
+  summarize(count =sum(count))
+
+sum_proteo <- sum_proteo %>%
+  mutate_at(c(3:6), as.factor)%>%
+   filter(count >= 1)
+
+sum_proteo$Depth     <- factor(sum_proteo$Depth, levels = c("0-5 cm", "5-10 cm", "20-30 cm", "40-50 cm", "80-100 cm"))
+sum_proteo$Zone      <- factor(sum_proteo$Zone, levels = c("PZ","LM","HM"))
+sum_proteo$Class     <- factor(sum_proteo$Class, levels = c("Alphaproteobacteria","Gammaproteobacteria","Magnetococcia","Zetaproteobacteria","others" ))
+sum_proteo$Treatment <- recode_factor(sum_proteo$Treatment ,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+
+plot_Bubble_Proteo <-  ggplot(sum_proteo, aes(x=Treatment, y=Order, size=count, color=Treatment)) +
+  geom_point(alpha=0.7, show.legend =FALSE) +
+  scale_size(range=c(2, 10)) +
+  scale_color_manual(values = c( "#4575B4", "#FDAE61", "#D73027")) +
+  labs(x = "Phylum-Zone", y = "Relative abundance", title = "Relative abundance of microbial species") +
+  theme_JM+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plot_Bubble_Proteo+ facet_wrap(~Zone*Depth, ncol=5)
+
+# Bubble plots for Genus level
+# Filter dataset to only include methane relevant Genus, based on Yang, S., Anthony, S. E., Jenrich, M., in ’t Zandt, M. H., Strauss, J., Overduin, P. P., Grosse, G., Angelopoulos, M., Biskaborn, B. K., Grigoriev, M. N., Wagner, D., Knoblauch, C., Jaeschke, A., Rethemeyer, J., Kallmeyer, J., & Liebner, S. (2023). Microbial methane cycling in sediments of Arctic thermokarst lagoons. Global Change Biology, 29(10), 2714–2731. https://doi.org/10.1111/gcb.16649
+
+# All hydrogenotrophic methanogens
+Hyd_MOs <- list(c("Methanobacterium","Methanobrevibacter","Methanosphaera","Methanocellales","Methanomicrobiaceae","Methanoregula","Rice-Cluster-II"))
+
+# All acetoclastic methanogens
+Ace_MOs <- list(c("Methanosaeta","Methanosarcina"))
+
+# All methylotrophic methanogens
+Met_MOs <- list(c("Ca. Methanomethylicus","Methanofastidiosales","Methanomassiliicoccales","Methanoassiliicoccaceae"))
+
+# All Methane oxidating bacteria (MOB Type 1)
+MOB_MOs <- list(c("Methylomonadaceae","Crenothrix","Methylobacter","Methyloglobulus","Methyloprofundus","Methylosarcina","Methylovulum","Methylophagaceae","Methyloacidiphilaceae"))
+
+# All anaerobic methane oxidizing bacteria (Canonical ANME & Noncanonical putative AOM)
+AMOB_MOs <- list(c("ANME-2a-2b","Ca. Methanoperedens","ANME-3","Methylomirabilaceae","Ca. Methylomirabilis","Sh765B-TzT-35","Z114MB74"))
+
+df_methane_MOs <- taxa_sum_Genus %>%
+  filter(Genus %in% c(Hyd_MOs, Ace_MOs, Met_MOs, MOB_MOs, AMOB_MOs)) %>%
+  mutate(pathway = case_when(
+    Genus %in% Hyd_MOs ~ "Hydrogenotrophic methanogens",
+    Genus %in% Ace_MOs ~ "Acetoclastic methanogens",
+    Genus %in% Met_MOs ~ "Methylotrophic methanogens",
+    Genus %in% MOB_MOs ~ "Methane oxidizing bacteria",
+    Genus %in% AMOB_MOs ~ "Anaerobic methane oxidizing bacteria",
+    TRUE ~ "other"  # Optional: Assign "other" for KO numbers not matching any pathway
+  ))
+
+df_methane_MOs_sum <- df_methane_MOs %>%
+  group_by(Zone, Treatment, Depth,Kingdom, Phylum, Class, Order, Family, Genus) %>%
+  summarize(count =sum(count))
+
+df_methane_MOs_sum   <- df_methane_MOs_sum   %>%
+  mutate_at(c(3:6), as.factor)%>%
+   filter(count >= 1)
+
+df_methane_MOs_sum$Depth     <- factor(df_methane_MOs_sum $Depth, levels = c("0-5 cm", "5-10 cm", "20-30 cm", "40-50 cm", "80-100 cm"))
+df_methane_MOs_sum $Zone      <- factor(df_methane_MOs_sum $Zone, levels = c("PZ","LM","HM"))
+df_methane_MOs_sum $Treatment <- recode_factor(df_methane_MOs_sum $Treatment ,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+
+plot_methane_MOs <-  ggplot(df_methane_MOs_sum , aes(x=Treatment, y=Genus, size=count, color=Treatment)) +
+  geom_point(alpha=0.7, show.legend =FALSE) +
+  scale_size(range=c(2, 10)) +
+  scale_color_manual(values = c( "#4575B4", "#FDAE61", "#D73027")) +
+  labs(x = "Genus-Zone", y = "Relative abundance", title = "Relative abundance of microbial species") +
+  theme_JM+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plot_methane_MOs+ facet_wrap(~Zone*Depth, ncol=5)
+```
+\pagebreak
+  
+# Alpha Diversity 
+```{r,message=FALSE, warning=FALSE}
+# Create a phyloseq object
+a_tab = otu_table(as.matrix(tab[,1:(ncol(tab)-6)]), taxa_are_rows=T) 
+t_tab = tax_table(as.matrix(tab[,(ncol(tab)-5):ncol(tab)])) 
+metadata <- metadata %>%
+  mutate_at(c(3:12), as.factor)
+df_samp = sample_data(metadata) 
+sample_ids <- metadata[, 1]
+rownames(df_samp) <- sample_ids
+
+ ps = phyloseq(
+    otu_table(as.matrix(tab[,1:(ncol(tab)-6)]), taxa_are_rows=T),
+    tax_table(as.matrix(tab[,(ncol(tab)-5):ncol(tab)])),
+    sample_data(df_samp)
+   )
+ 
+# Remove MOCK samples and negative controls
+samples_to_remove <- c("X136", "X137", "X138", "X139")
+ps <- subset_samples(ps, !(sample_names(ps) %in% samples_to_remove))
+
+# Reorder Factors
+ps@sam_data[["Zone"]]      <- factor(ps@sam_data[["Zone"]], levels = c("PZ","LM","HM"))
+ps@sam_data[["Treatment"]] <- recode_factor(ps@sam_data[["Treatment"]],  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+ps@sam_data[["Depth"]]     <- factor(ps@sam_data[["Depth"]],levels=c("0-5 cm","5-10 cm", "20-30 cm", "40-50 cm","80-100 cm" ))
+
+# Estimat richness for different measures 
+df_a_mean <- as.data.frame(estimate_richness(ps, measures=c("Observed", "Shannon","Chao1")))
+
+# Add metadata to richness estimates
+df_a_mean <- merge(df_samp, df_a_mean, by.x = "row.names", by.y = "row.names")
+
+# Summarise dataframe for different alpha diversity measures
+df_a_mean <- df_a_mean %>%
+  group_by(Treatment, Zone, Depth) %>%
+  summarise(mean_chao1 = mean(Chao1),
+            se_chao1 = sd(Chao1) / sqrt(n()),
+            mean_shannon = mean(Shannon),
+            se_shannon = sd(Shannon) / sqrt(n()),
+            mean_observed = mean(Observed),
+            se_observed = sd(Observed) / sqrt(n()))
+
+df_a_mean$Treatment  <- recode_factor(df_a_mean$Treatment ,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+df_a_mean$Depth      <- factor(df_a_mean$Depth, levels = c("0-5 cm", "5-10 cm", "20-30 cm", "40-50 cm", "80-100 cm"))
+df_a_mean$Depth_cont <- ifelse(df_a_mean$Depth == "0-5 cm", 2.5, 
+                          ifelse(df_a_mean$Depth == "5-10 cm", 7.5, 
+                          ifelse(df_a_mean$Depth == "20-30 cm", 25, 
+                          ifelse(df_a_mean$Depth == "40-50 cm", 45, 90))))
+df_a_mean$Zone       <- factor(df_a_mean$Zone, levels = c("PZ","LM","HM"))
+
+# Alpha Diversity Plots (https://joey711.github.io/phyloseq/plot_richness-examples.html)
+plot_a_all <-plot_richness(ps, "Zone","Treatment",  title="unmerged")+
+  geom_boxplot() +
+  scale_color_manual(values = my_palette, breaks = c("ambient", "+1.5°C", "+3.0°C"))+
+    theme_JM
+
+plot_a_T <- plot_richness(ps, x="Treatment", color="Treatment", measures=c("Observed", "Shannon","Chao1")) + 
+    geom_boxplot()+
+    scale_color_manual(values = my_palette, breaks = c("ambient", "+1.5°C", "+3.0°C"))+
+    theme_JM
+
+plot_a_Z <- plot_richness(ps, x="Zone", color="Zone", measures=c("Observed", "Shannon","Chao1")) + 
+    geom_boxplot()+
+    scale_color_manual(values = my_palette2, breaks = c("PZ", "LM", "HM"))+
+    theme_JM
+
+plot_a_TZ_Sha <- plot_richness(ps, x="Treatment", color="Treatment", measures=c("Shannon")) + 
+    geom_boxplot()+
+    scale_color_manual(values = my_palette, breaks = c("ambient", "+1.5°C", "+3.0°C"))+
+    theme_JM+
+    facet_wrap(~Zone, ncol=3)
+
+plot_a_TZ_Cha <- plot_richness(ps, x="Treatment", color="Treatment", measures=c("Chao1")) + 
+    geom_boxplot()+
+    scale_color_manual(values = my_palette, breaks = c("ambient", "+1.5°C", "+3.0°C"))+
+    theme_JM+
+    facet_wrap(~Zone, ncol=3)
+
+plot_a_TZD_Cha <- plot_richness(ps, x="Treatment", color="Treatment", measures=c("Chao1")) + 
+    geom_boxplot()+
+    scale_color_manual(values = my_palette, breaks = c("ambient", "+1.5°C", "+3.0°C"))+
+    theme_JM+
+    facet_wrap(~Zone*Depth, ncol=5)
+
+# Plot the means with se as error bars
+plot_a_D_Cha <-ggplot(df_a_mean, aes(x = Depth_cont, y = mean_chao1, color = Treatment)) +
+  geom_point(size=3.5) + 
+  coord_flip() +
+  scale_x_reverse(name="Depth [cm]")+
+  geom_line(size=1)+
+  geom_errorbar(aes(ymin = mean_chao1 - se_chao1, ymax = mean_chao1 + se_chao1, group="Depth"),alpha=1, size=.1,position = position_dodge(width = 22)) +
+  scale_color_manual(values = my_palette, breaks = c("ambient", "+1.5°C", "+3.0°C")) +
+  theme_JM +
+  facet_wrap(~Zone, ncol = 5)
+
+# Plot the means with se as error bars
+plot_a_D_Sha <-ggplot(df_a_mean, aes(x = Depth_cont, y = mean_shannon, color = Treatment)) +
+  geom_point(size=3.5) + 
+  coord_flip() +
+  scale_x_reverse(name="Depth [cm]")+
+  geom_line(size=1)+
+  geom_errorbar(aes(ymin = mean_shannon - se_shannon, ymax = mean_shannon + se_shannon, group="Depth"),alpha=1, size=.1,position = position_dodge(width = 22)) +
+  scale_color_manual(values = my_palette, breaks = c("ambient", "+1.5°C", "+3.0°C")) +
+  theme_JM +
+  facet_wrap(~Zone, ncol = 5)
+
+plot_a_all
+plot_a_T
+plot_a_Z
+plot_a_TZ_Sha
+plot_a_TZ_Cha 
+plot_a_TZD_Cha
+plot_a_D_Cha 
+plot_a_D_Sha
+```
+
+\pagebreak
+
+# Heat maps
+```{r,message=FALSE, warning=FALSE}
+#Sort the OTUs by abundance and pick the top 20
+top20OTU.names = names(sort(taxa_sums(ps), TRUE)[1:20])
+#Cut down the physeq.tree data to only the top 10 Phyla
+top20OTU = prune_taxa(top20OTU.names, ps)
+
+plot_heatmap(top20OTU)
+
+plot_heatmap(top20OTU, sample.label="Treatment", sample.order="Treatment", taxa.label="Genus", taxa.order="Phylum",low="white", high="purple", na.value="grey")
+
+```
+\pagebreak
+# Beta Diversity
+```{r,message=FALSE, warning=FALSE}
+# Transform phyloseq object to relative abundance (source: https://rpubs.com/lconteville/714853)
+ps_beta = transform_sample_counts(ps, function(x) x / sum(x) * 100) 
+head(otu_table(ps_beta)[,1:6])
+
+rel_bray <- phyloseq::distance(ps_beta, method = "bray")
+rel_bray <- as.matrix(rel_bray)
+
+sub_dist <- list()
+groups_zone <- sample_data(ps_beta)$Zone
+groups_treatment <- sample_data(ps_beta)$Treatment
+
+for (zone in levels(groups_zone)) { 
+  for (treatment in levels(groups_treatment)) {
+    row_group <- which(groups_zone == zone & groups_treatment == treatment)
+    sample_group <- sample_names(ps_beta)[row_group]
+    sub_dist[[paste(zone, treatment, sep = "_")]] <- rel_bray[sample_group, sample_group]
+    sub_dist[[paste(zone, treatment, sep = "_")]][!lower.tri(sub_dist[[paste(zone, treatment, sep = "_")]])] <- NA
+  }
+}
+
+braygroups <- melt(sub_dist)
+df.bray <- braygroups[complete.cases(braygroups), ]
+df.bray$Zone <- sapply(strsplit(as.character(df.bray$L1), "_"), `[`, 1)
+df.bray$Treatment <- sapply(strsplit(as.character(df.bray$L1), "_"), `[`, 2)
+df.bray$L1 <- NULL
+
+# Plot beta diversity as boxplots
+df.bray$Zone      <- factor(df.bray$Zone, levels = c("PZ","LM","HM"))
+df.bray$Treatment <- recode_factor(df.bray$Treatment,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+
+plot_beta<-ggplot(df.bray, aes(x=Zone, y=value, colour=Treatment)) +
+  #geom_jitter(aes(x=Zone, y=value,color=Treatment)) + 
+  geom_boxplot(alpha=0.6) +  
+  theme(legend.position="none") +
+  ylab("Bray-Curtis diversity") +
+  scale_colour_manual(values = c("#4575B4", "#FDAE61","#D73027"))+
+  theme(axis.title.x=element_blank(), axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12), axis.text.y=element_text(size=12))+
+  theme_JM
+
+
+# Ordination
+ord <- ordinate(ps_beta, method="PCoA", distance = "bray")
+
+plot_ord_beta<-plot_ordination(ps_beta, ord, color = "Treatment", shape="Zone") + 
+  geom_point(size=4) + 
+  scale_colour_manual(values = c("#4575B4", "#FDAE61","#D73027"))+
+  stat_ellipse(aes(group=Zone))+
+  theme_pubclean()
+
+# ORdination alternative                                                      
+#cap_ord <- ordinate(
+ # physeq = ps_itree_ra, 
+  #method = "CAP",
+  #distance = bacs_dist,
+  #formula = ~ pH + Ca + Mg + OM.percent+M3_P
+#)
+
+#generate distance matrices and NMDS ordinations
+#set.seed(888)
+#bacs_dist <- phyloseq::distance(ps_ra, "bray")#checks homogeneity of group dispersion
+#check group dispersion
+#sample_df <- data.frame(sample_data(ps_ra))
+#beta <- betadisper(bacs_dist, sample_df$Treatment)
+#permutest(beta)
+#bacs.ord <- metaMDS(bacs_dist, distance = "bray", k = 2, trymax = 100)#stress 0.1113
+
+#set.seed(888)
+
+#PERMANOVA of Treatment
+#adonis_sp<- adonis2(bacs_dist ~ Treatment*Zone, data=sample_df,  permutations = 999, method = "bray")
+#adonis_sp#0.001
+#pairwise.perm.manova(bacs_dist,sample_df$Treatment,nperm=100)
+```
+\pagebreak
+
+# Step 7: Bar charts
+## Step 7a: Absolute barcharts
+```{r,message=FALSE, warning=FALSE}
+
+#Sort the Phyla by abundance and pick the top 10
+top10P.names = sort(tapply(taxa_sums(ps), tax_table(ps)[, "Phylum"], sum), TRUE)[1:10]
+#Cut down the phyloseq object to only the top 10 Phyla
+top10P = subset_taxa(ps, Phylum %in% names(top10P.names))
+
+# install speedyseq package to merge ps objects without transforming factors to double
+remotes::install_github("mikemc/speedyseq")
+library(speedyseq)
+
+# Top 10 Phyla by Treatment
+sample_data(top10P) <- sample_data(top10P) %>%
+  transform(Treatment = Treatment)
+sample_data(top10P) 
+
+top10P_T_merged<-merge_samples2(top10P, "Treatment", fun_otu = mean, reorder = FALSE)
+ps.phylum_T = tax_glom(top10P_T_merged, taxrank="Phylum", NArm=FALSE)
+
+plot_bar_T <-plot_bar(ps.phylum_T,x="Treatment", fill="Phylum") + 
+  scale_fill_manual(values = c("#D73027","#FDAE61","yellow","green3","darkgreen","purple","blue","#4575B4","grey","black"))+
+theme_JM
+
+# Top 10 Phyla by Zone
+sample_data(top10P) <- sample_data(top10P) %>%
+  transform(Zone = Zone)
+sample_data(top10P) 
+
+top10P_Z_merged<-merge_samples2(top10P, "Zone", fun_otu = mean, reorder = FALSE)
+ps.phylum_Z = tax_glom(top10P_Z_merged, taxrank="Phylum", NArm=FALSE)
+
+plot_bar_Z<- plot_bar(ps.phylum_Z,x="Zone", fill="Phylum") + 
+  scale_fill_manual(values = c("#D73027","#FDAE61","yellow","green3","darkgreen","purple","blue","#4575B4","grey","black"))+
+theme_JM
+
+# Top 10 Phyla by Depth
+sample_data(top10P) <- sample_data(top10P) %>%
+  transform(Zone = Zone)
+sample_data(top10P) 
+
+top10P_D_merged<-merge_samples2(top10P, "Depth", fun_otu = mean, reorder = FALSE)
+ps.phylum_D = tax_glom(top10P_D_merged, taxrank="Phylum", NArm=FALSE)
+
+# Abundance Depth
+plot_bar_D<-plot_bar(ps.phylum_D,x="Depth", fill="Phylum") + 
+  scale_fill_manual(values = c("#D73027","#FDAE61","yellow","green3","darkgreen","purple","blue","#4575B4","grey","black"))+
+theme_JM
+
+# Relative Abundance Depth
+ps.phylum_D_rel <- transform_sample_counts(ps.phylum_D, function(x) 100 * x/sum(x))
+plot_bar_D_rel<-plot_bar(ps.phylum_D_rel,x="Depth", fill="Phylum") + 
+  scale_fill_manual(values = c("#D73027","#FDAE61","yellow","green3","darkgreen","purple","blue","#4575B4","grey","black"))+
+theme_JM
+
+# Top 10 Phyla by Treatment*Zone
+sample_data(top10P) <- sample_data(top10P) %>%
+  transform(Treatment_Zone = Treatment:Zone)
+sample_data(top10P) 
+
+top10P_TZ_merged<-merge_samples2(top10P, "Treatment_Zone", fun_otu = mean, reorder = FALSE)
+ps.phylum_TZ = tax_glom(top10P_TZ_merged, taxrank="Phylum", NArm=FALSE)
+
+# Abundance Treatment Zone
+plot_bar_TZ<- plot_bar(ps.phylum_TZ,x="Treatment", fill="Phylum") + facet_wrap(~Zone, scales= "free_x", nrow=3)+  scale_fill_manual(values = c("#D73027","#FDAE61","yellow","green3","darkgreen","purple","blue","#4575B4","grey","black"))+
+theme_JM
+
+# Relative Abundance Treatment Zone
+ps.phylum_TZ_rel <- transform_sample_counts(ps.phylum_TZ, function(x) 100 * x/sum(x))
+plot_bar_TZ_rel<- plot_bar(ps.phylum_TZ_rel,x="Treatment", fill="Phylum") + facet_wrap(~Zone, scales= "free_x", nrow=3)+  scale_fill_manual(values = c("#D73027","#FDAE61","yellow","green3","darkgreen","purple","blue","#4575B4","grey","black"))+
+theme_JM
+
+# Top 10 Phyla by Treatment*Zone* Sample
+sample_data(top10P) <- sample_data(top10P) %>%
+  transform(Zone_Plot = Zone:Plot)
+sample_data(top10P) 
+
+top10P_ZP_merged<-merge_samples2(top10P, "Zone_Plot", fun_otu = mean, reorder = FALSE)
+ps.phylum_ZP = tax_glom(top10P_ZP_merged, taxrank="Phylum", NArm=FALSE)
+
+ps.phylum_ZP_rel <- transform_sample_counts(ps.phylum_ZP, function(x) 100 * x/sum(x))
+
+# Abundance Plot
+plot_bar_ZP<- plot_bar(ps.phylum_ZP,x="Plot", fill="Phylum") + facet_wrap(~Zone, scales= "free_x", nrow=3)+  scale_fill_manual(values = c("#D73027","#FDAE61","yellow","green3","darkgreen","purple","blue","#4575B4","grey","black"))+
+theme_JM
+
+# Realtive abundance Plot
+ps.phylum_ZP_rel <- transform_sample_counts(ps.phylum_ZP, function(x) 100 * x/sum(x))
+plot_bar_ZP_rel<- plot_bar(ps.phylum_ZP_rel,x="Plot", fill="Phylum") + facet_wrap(~Zone, scales= "free_x", nrow=3)+  scale_fill_manual(values = c("#D73027","#FDAE61","yellow","green3","darkgreen","purple","blue","#4575B4","grey","black"))+
+theme_JM
+
+plot_bar_T
+plot_bar_Z
+plot_bar_D
+plot_bar_D_rel
+plot_bar_TZ
+plot_bar_TZ_rel + theme(legend.position = "top")
+plot_bar_ZP
+plot_bar_ZP_rel
+```
+\pagebreak
+
+## Step 7b: Relative barcharts (incl. others)
+```{r,message=FALSE, warning=FALSE}
+# Alternative of showing Top9 Taxa and "others" + relative abundances
+#https://github.com/joey711/phyloseq/issues/1197
+
+### DECIDE how many taxa you want to see
+topN = 10 # all others will be grouped in "Others"
+topTaxa <- ps %>%  # CHOOSE YOUR DATASET !
+  psmelt %>% group_by(Phylum) %>% # melt the table and group by tax level
+  summarise(Abundance=sum(Abundance)) %>% # find most overall abundant taxa
+  arrange(desc(Abundance)) %>% # order them 
+  mutate(aggTaxo=as.factor(case_when( # aggTaxo will become the plot legend
+    row_number()<=topN~Phylum, row_number()>topN~'Others'))) %>% 
+  dplyr::select(-Abundance) %>% #flush abundance value
+  head(n=topN+1) # +1 to include the Others section! 
+
+### CREATE an object that will be fed into ggplot
+ps_others <- ps %>% # CHOOSE YOUR DATASET !
+  psmelt %>% # "melt" the phyloseq object into a table
+  inner_join(.,topTaxa, by="Phylum") %>% # use topTaxa to join aggTaxo variable
+  aggregate(Abundance~Treatment+aggTaxo+Zone, # Abundance is aggregated...
+            data=., FUN=sum)  # ...sums "Others" taxa by specified variables
+
+# Relative abundance counts plot
+plot_others<-ggplot(ps_others, aes(x=Treatment, y=Abundance, fill=aggTaxo)) +
+  geom_bar(stat="identity",position="fill") + # change to "stack" to plot total counts
+  labs( fill="Phylum", x="Zone", y="Relative abundance") +
+  scale_fill_manual(values = c("#D73027","#FDAE61","yellow","green3","darkgreen","purple","blue","#4575B4","grey","black", "white"))+
+  facet_wrap(~Zone, nrow=3) + 
+  theme_JM
+  
+plot_others
+```
+
+
+# Step 10: Tax4Fun2 - Visualize Functional Predictions
+```{r}
+my_colors <- c("darkblue","#4575B4", "yellow")
+my_colors <- c("#efedf5","#bcbddc", "#756bb1")
+my_colors <- c("#fee8c8","#fdbb84", "#e34a33")
+#2ca25f
+# Functional predictions
+file_path_fun_pred <- "K:/PhD/data/WP2_microbial/GFZ_RNA_DNA/Tax4Fun2/Tax4Fun2_output_folder/functional_prediction_raw.txt"
+df_fun_pred <- read_delim(file_path_fun_pred, delim = "\t", col_names = TRUE)
+
+# All methanogenesis realted KOs
+mg_ko_text <- "(K00200+K00201+K00202+K00203-K11261+(K00205,K11260,K00204)) K00672 K01499 (K00319,K13942) K00320 (K00577+K00578+K00579+K00580+K00581-K00582-K00583+ K00584) (K00399+K00401+K00402) (K22480+K22481+K22482,K03388+K03389+K03390,K08264+ K08265,K03388+K03389+K03390+K14127+(K14126+K14128,K22516+K00125)) ((K00925 K00625),K01895) (K00193+K00197+K00194) (K00577+K00578+K00579+K00580+ K00581-K00582-K00583+K00584) (K00399+K00401+K00402) (K22480+K22481+K22482,K03388+ K03389+K03390,K08264+K08265,K03388+K03389+K03390+K14127+(K14126+K14128,K22516+ K00125)) K14080+K04480+K14081 K00399+K00401+K00402 (K22480+K22481+K22482,K03388+ K03389+K03390,K08264+K08265,K03388+K03389+K03390+K14127+(K14126+K14128,K22516+ K00125)) K14082 ((K16177-K16176),(K16179-K16178),(K14084-K14083)) K00399+K00401+ K00402 (K22480+K22481+K22482,K03388+K03389+K03390,K08264+K08265,K03388+ K03389+K03390+K14127+(K14126+K14128,K22516+K00125))"
+all_mg_ko_numbers <- unlist(regmatches(mg_ko_text, gregexpr("K\\d+", mg_ko_text)))
+methanogenesis_ko <- unique(all_mg_ko_numbers)
+
+# All methanotrophy realted KOs
+methanotrophy_ko <- c("K10944", "K10945", "K10946", "K16157", "K16158", "K16159", "K16160","K16161", "K16162", "K14029", "K23995")
+
+# All dissmiliatory sulfate reduction KOs
+so_ko_text<- "(K00958 (K00394+K00395) (K11180+K11181-K27196) (K27187+K27188+K27189+K27190+K27191)"
+all_so_ko_numbers <- unlist(regmatches(so_ko_text, gregexpr("K\\d+", so_ko_text)))
+sulfate_reduction_ko <- unique(all_so_ko_numbers)
+
+# All carbon fixiation in prokaryotes
+c_ko_text <- "(K00169+K00170+K00171+K00172,K03737) (K01007,K01006) K01595,K01959+K01960,K01958) K00024 (K01676,K01679,K01677+K01678) (K00239+K00240-K00241-K00242K18556+K18557+K18558+K18559+K18560) (K01902+K01903) (K00174+K00175-K00177-K00176) K00031 (K01681,K01682) (K15230+K15231,K15232+K15233 K15234)(K02160+K01961+K01962+K01963) K14468 K14469 K15052 K05606 (K01847,K01848+K01849) (K14471+K14472) (K00239+K00240+K00241) K01679 K08691 K14449 K14470 K09709 (K01964+K15037+K15036) K15017 K15039 K15018 K15019 K15020 K05606 (K01848+K01849) (K15038,K15017) K14465 (K14466,K18861,K25774) K14534 K15016 K00626 	(K00169+K00170+K00171+K00172) K01007 K01595 K00024 (K01677+K01678) (K00239+K00240-K00241-K18860) (K01902+K01903) (K15038,K15017) K14465 (K14467,K18861,K25774) K14534 K15016 K00626 	K00198 (K05299-K15022,K22015+K25123+K25124) K01938 K01491-K01500 K00297-K25007-K25008 K15023 K14138+K00197+K00194 (K00625,K13788,K15024) K00925 (K00169+K00170+K00171+K00172) (K01959+K01960) K00024 (K01677+K01678) (K18209+K18210) (K01902+K01903) (K00174+K00175+K00176+K00177)"
+all_c_ko_numbers <- unlist(regmatches(c_ko_text, gregexpr("K\\d+", c_ko_text)))
+carbon_ko <- unique(all_c_ko_numbers)
+
+  df_CH4 <- df_fun_pred %>%
+  filter(KO %in% c(methanogenesis_ko, methanotrophy_ko, sulfate_reduction_ko, carbon_ko)) %>%
+  mutate(pathway = case_when(
+    KO %in% methanogenesis_ko ~ "methanogenesis",
+    KO %in% methanotrophy_ko ~ "methanotrophy",
+    KO %in% sulfate_reduction_ko ~ "sulfate reduction",
+    KO %in% carbon_ko ~ "carbon fixation in prokaryotes",
+    TRUE ~ "other"  # Optional: Assign "other" for KO numbers not matching any pathway
+  ))
+
+
+df_CH4_long <- reshape2::melt(df_CH4, id.vars = c("pathway", "KO", "description"))
+df_CH4_long$value<-as.numeric(df_CH4_long$value)
+
+df_CH4_long$sample_name <- df_CH4_long$variable
+df_CH4_meta <- merge(df_CH4_long , metadata, by.x = "sample_name", by.y = "sample_name", all.x = TRUE)
+df_CH4_meta$pathway<-as.factor(df_CH4_meta$pathway)
+df_CH4_meta$value<-as.numeric(df_CH4_meta$value)
+
+df_CH4_fac_sum <- df_CH4_meta%>%
+   group_by(pathway, Treatment, Zone, Depth) %>%
+  summarise(
+    abundance = mean(value, na.rm=TRUE),
+    se_abundance = sd(value, na.rm=TRUE) / sqrt(n())
+  )%>%
+  filter(!is.na(Treatment))
+
+df_CH4_fac_sum$pathway    <- factor(df_CH4_fac_sum$pathway ,levels = c("carbon fixation in prokaryotes","methanotrophy", "sulfate reduction","methanogenesis"))
+df_CH4_fac_sum$pathway    <- recode_factor(df_CH4_fac_sum$pathway ,  "carbon fixation in prokaryotes"="Carbon fixiation", "methanotrophy"="Methanotrophy","sulfate reduction"="Sulfate reduction", "methanogenesis"="Methanogenesis")
+df_CH4_fac_sum$Treatment  <- recode_factor(df_CH4_fac_sum$Treatment ,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+df_CH4_fac_sum$Zone       <- factor(df_CH4_fac_sum$Zone, levels = c("PZ","LM","HM"))
+df_CH4_fac_sum$Depth      <- factor(df_CH4_fac_sum$Depth, levels = c("0-5 cm", "5-10 cm", "20-30 cm", "40-50 cm", "80-100 cm"))
+
+plot_CH4 <- ggplot(df_CH4_fac_sum, aes(x = pathway, y =abundance, fill =Treatment)) +
+   geom_bar(stat = "identity", position="dodge") + 
+   geom_errorbar(aes(x=pathway,ymin = abundance - se_abundance, ymax = abundance + se_abundance, group=Treatment), width=0.4, colour="black", alpha=0.9, size=1,position = position_dodge(width = .9)) + 
+   scale_fill_manual(values = c("ambient" = "#4575B4", "+1.5°C" = "#FDAE61", "+3.0°C" = "#D73027"), name = "Warming") +# Add error bars
+   #labs(x = "Plot", y = "Redox potential [mV]", fill = "Plot") +
+   theme_pubclean() +   
+   theme(axis.text.x = element_text(angle = 65, hjust = 1, vjust = 1, size = 16), axis.text.y =element_text(hjust = 1, vjust = 1,size=16))+
+   labs(x = "Pathway", y = "Abundance")+
+   facet_wrap(~Zone*Depth, ncol=5)
+
+plot_heatmap_CH4<- ggplot(df_CH4_fac_sum, aes(x = Treatment, y = pathway, fill = abundance)) +
+  geom_tile(color="grey") +
+  labs(x = "Treatment", y = "Pathway", fill = "abundance") +
+    scale_fill_gradientn(colors = my_colors, na.value = "white")  + 
+  theme_pubclean() +  # Apply a theme (optional)
+  facet_grid(~ Zone*Depth)+
+  theme_pubclean()
+
+plot_heatmap_CH4_Z<- ggplot(df_CH4_fac_sum, aes(x = Treatment, y = pathway, fill = abundance)) +
+  geom_tile(color="grey") +
+  labs(x = "Treatment", y = "Pathway", fill = "abundance") +
+    scale_fill_gradientn(colors = my_colors, na.value = "white", name = "Abundance")  + 
+  theme_pubclean() +  # Apply a theme (optional)
+  facet_grid(~ Zone)  + 
+  theme(axis.text.y = element_text(colour = "black", size = 12, face = "bold"), 
+        axis.text.x = element_text(colour = "black", face = "bold", size = 12), 
+        legend.text = element_text(size = 12, face ="bold", colour ="black"), 
+        legend.position = "right", axis.title.y = element_text(face = "bold", size = 14), 
+        axis.title.x = element_text(face = "bold", size = 14, colour = "black"), 
+        legend.title = element_text(size = 14, colour = "black", face = "bold"), 
+        panel.background = element_blank(), panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+        legend.key=element_blank()) 
+  #theme_pubclean()+
+  #theme(axis.text.x = element_text(angle = 65, hjust = 1, vjust = 1, size = 14), axis.text.y =element_text(hjust = 1, vjust = 1,size=14),legend.title=element_text(size=14))
+
+df_CH4_fac_sum_Z <- df_CH4_meta%>%
+   group_by(pathway, Treatment, Zone) %>%
+  summarise(
+    abundance = mean(value, na.rm=TRUE),
+    se_abundance = sd(value, na.rm=TRUE) / sqrt(n())
+  )%>%
+  filter(!is.na(Treatment))
+
+df_CH4_fac_sum_Z$pathway    <- factor(df_CH4_fac_sum_Z$pathway ,levels = c("carbon fixation in prokaryotes","methanotrophy", "sulfate reduction","methanogenesis"))
+df_CH4_fac_sum_Z$pathway    <- recode_factor(df_CH4_fac_sum_Z$pathway ,  "carbon fixation in prokaryotes"="Carbon fixiation", "methanotrophy"="Methanotrophy","sulfate reduction"="Sulfate reduction", "methanogenesis"="Methanogenesis")
+df_CH4_fac_sum_Z$Treatment  <- recode_factor(df_CH4_fac_sum_Z$Treatment ,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+df_CH4_fac_sum_Z$Zone       <- factor(df_CH4_fac_sum_Z$Zone, levels = c("PZ","LM","HM"))
+
+plot_CH4_Z <- ggplot(df_CH4_fac_sum_Z, aes(x = pathway, y =abundance, fill =Treatment)) +
+   geom_bar(stat = "identity", position="dodge") + 
+   geom_errorbar(aes(x=pathway,ymin = abundance - se_abundance, ymax = abundance + se_abundance, group=Treatment), width=0.4, colour="black", alpha=0.9, size=1,position = position_dodge(width = .9)) + 
+   scale_fill_manual(values = c("ambient" = "#4575B4", "+1.5°C" = "#FDAE61", "+3.0°C" = "#D73027"), name = "Warming") +# Add error bars
+   #labs(x = "Plot", y = "Redox potential [mV]", fill = "Plot") +
+   theme_pubclean() +
+   facet_wrap(~Zone, ncol=3)+
+   theme(axis.text.x = element_text(angle = 65, hjust = 1, vjust = 1, size = 16), axis.text.y =element_text(hjust = 1, vjust = 1,size=16))+
+  labs(x = "Pathway", y = "Abundance")
+
+# Pathway predictions
+file_path_fun_pred <- "K:/PhD/data/WP2_microbial/GFZ_RNA_DNA/MERIT_RNA_repo/pathway_prediction_raw.txt"
+df_path_pred <- read_delim(file_path_fun_pred, delim = "\t", col_names = TRUE)
+
+df_path_pred_long <- reshape2::melt(df_path_pred, id.vars = c("pathway", "level1", "level2", "level3"))
+df_path_pred_long$value<-as.numeric(df_path_pred_long$value)
+
+df_path_pred_long$sample_name <- df_path_pred_long$variable
+df_path_pred_meta <- merge(df_path_pred_long , metadata, by.x = "sample_name", by.y = "sample_name", all.x = TRUE)
+df_path_pred_meta$level1<-as.factor(df_path_pred_meta$level1)
+df_path_pred_meta$value<-as.numeric(df_path_pred_meta$value)
+
+df_path_pred_sum <- df_path_pred_meta%>%
+   group_by(pathway, level1, level2, level3) %>%
+  summarise(
+    abundance = mean(value, na.rm=TRUE),
+    se_abundance = sd(value, na.rm=TRUE) / sqrt(n())
+  )
+
+# Pathway predictions on factor level
+df_path_pred_fac_sum <- df_path_pred_meta%>%
+   group_by(pathway, level1, level2, level3, Treatment, Zone) %>%
+  summarise(
+    abundance = mean(value, na.rm=TRUE),
+    se_abundance = sd(value, na.rm=TRUE) / sqrt(n())
+  )
+
+# Filter Top 10 Pathways
+top_10_pathways <- df_path_pred_fac_sum %>%
+  group_by(level2) %>%
+  summarise(total_abundance = sum(abundance, na.rm = TRUE)) %>%
+  top_n(10, total_abundance) %>%
+  pull(level2)
+
+# Filter the original dataframe to include only the top 10 pathways
+df_path_pred_top10 <- df_path_pred_fac_sum %>%
+  filter(level2 %in% top_10_pathways)%>%
+  filter(!is.na(Treatment))
+
+# Relative abundance
+df_path_pred_top10 <- df_path_pred_top10 %>%
+  group_by(Treatment, Zone)%>%
+ mutate(abundance_norm = abundance / sum(abundance) * 100)
+
+# Relative abundances with group for others
+df_path_pred_others <- df_path_pred_fac_sum %>%
+  filter(!level2 %in% top_10_pathways) %>%
+  group_by(Treatment, Zone) %>%
+  summarise(abundance = sum(abundance, na.rm = TRUE)) %>%
+  mutate(level2 = "Others")
+ 
+
+# Combine top 9 pathways with Others
+df_path_pred_others_10 <- bind_rows(df_path_pred_top10, df_path_pred_others)
+
+df_path_pred_others_10 <- df_path_pred_others_10%>%
+  mutate(abundance_norm = abundance / sum(abundance) * 100)
+
+# Adjust factors and reorder
+df_path_pred_others_10$Treatment  <- recode_factor(df_path_pred_others_10$Treatment ,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+df_path_pred_others_10$Zone      <- factor(df_path_pred_others_10$Zone, levels = c("PZ","LM","HM"))
+
+# Create the stacked bar plot
+plot_sbar_path_norm_others<- ggplot(df_path_pred_others_10, aes(fill = level2, y = abundance_norm, x = Treatment)) + 
+  geom_bar(position = "stack", stat = "identity") +
+  labs(x = "Treatment", y = "Abundance", fill = "Pathway") +  
+  scale_fill_manual(values = c( "darkred","pink","#FDAE61","yellow","chartreuse2","darkgreen","purple","blue","#4575B4","grey","black"))+
+  theme_pubclean()+
+  facet_grid(~ Zone)
+#  scale_fill_manual(values = c( "white","darkred","#D73027","pink","#FDAE61","yellow","green1","chartreuse3","darkgreen","purple","blue","#4575B4","cyan" ,"grey","black"))+
+
+# Energy metabolism pathways
+df_path_EMeta <- df_path_pred_fac_sum %>%
+  filter(level2 == "Energy metabolism") %>%
+  filter(!is.na(Treatment))  
+
+# Adjust factors and reorder
+df_path_EMeta$Treatment  <- recode_factor(df_path_EMeta$Treatment ,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+df_path_EMeta$Zone       <- factor(df_path_EMeta$Zone, levels = c("PZ","LM","HM"))
+
+# Heatmaps
+my_colors <- c("#4575B4", "yellow", "#D73027")
+plot_heatmap_EMeta <- ggplot(df_path_EMeta, aes(x = Treatment, y = level1, fill = abundance)) +
+  geom_tile(color="grey") +
+  labs(x = "Treatment", y = "Pathway", fill = "Abundance") +
+    scale_fill_gradientn(colors = my_colors, na.value = "white")  + 
+  theme_pubclean() +  # Apply a theme (optional)
+  facet_grid(~ Zone)+
+  theme_pubclean()
+
+# Depth based analysis
+# Pathway predictions on factor level
+df_path_pred_facTZD_sum <- df_path_pred_meta%>%
+   group_by(pathway, level1, level2, level3, Treatment, Zone, Depth) %>%
+  summarise(
+    abundance = mean(value, na.rm=TRUE),
+    se_abundance = sd(value, na.rm=TRUE) / sqrt(n())
+  )%>%
+  mutate(abundance_norm = abundance / sum(abundance) * 100)
+
+# Energy metabolism pathways Depth
+df_path_TZD_EMeta <- df_path_pred_facTZD_sum%>%
+  filter(level2 == "Energy metabolism") %>%
+  #filter(!level1 == "Photosynthesis"& !level1 == "Photosynthesis - antenna proteins") %>%
+  filter(!is.na(Treatment))  
+
+# Adjust factors and reorder
+df_path_TZD_EMeta$Treatment  <- recode_factor(df_path_TZD_EMeta$Treatment ,  "0"="ambient", "1.5"="+1.5°C","3"="+3.0°C")
+df_path_TZD_EMeta$Zone       <- factor(df_path_TZD_EMeta$Zone, levels = c("PZ","LM","HM"))
+df_path_TZD_EMeta$Depth      <- factor(df_path_TZD_EMeta$Depth, levels = c("0-5 cm", "5-10 cm", "20-30 cm", "40-50 cm", "80-100 cm"))
+
+# Heatmaps
+plot_heatmap_TZD_EMeta <- ggplot(df_path_TZD_EMeta, aes(x = Treatment, y = level1, fill = abundance)) +
+  geom_tile(color="grey") +
+  labs(x = "Treatment", y = "Pathway", fill = "Abundance") +
+  scale_fill_gradientn(colors = my_colors, na.value = "white")  + 
+  theme_pubclean() + 
+  facet_wrap(~ Zone*Depth, ncol = 5)+ 
+  theme(axis.text.y = element_text(colour = "black", size = 12, face = "bold"), 
+        axis.text.x = element_text(colour = "black", face = "bold", size = 12), 
+        legend.text = element_text(size = 12, face ="bold", colour ="black"), 
+        legend.position = "right", axis.title.y = element_text(face = "bold", size = 14), 
+        axis.title.x = element_text(face = "bold", size = 14, colour = "black"), 
+        legend.title = element_text(size = 14, colour = "black", face = "bold"), 
+        panel.background = element_blank(), panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+        legend.key=element_blank()) 
+
+plot_CH4
+plot_CH4_Z
+plot_heatmap_CH4
+plot_heatmap_CH4_Z
+plot_heatmap
+plot_heatmap_EMeta
+plot_heatmap_TZD_EMeta
+#plot_sbar_path
+#plot_sbar_path_norm
+plot_sbar_path_norm_others
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
